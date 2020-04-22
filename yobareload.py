@@ -1,73 +1,75 @@
 import argparse
-import hashlib
-from os import walk
-import time
-from subprocess import call
+import os
+from functools import partial
+
+import pyinotify
+
+# Exclude patterns
+IGNORE = [
+    ".*\.idea",
+    ".*\.DS_Store",
+    ".*\.git"
+    ".*venv",
+    ".*__pycache__",
+    ".*litt\..*\.log"
+]
 
 
-def md5_checksum(file_name):
-    hash_md5 = hashlib.md5()
-    with open(file_name, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+class EventHandler(pyinotify.ProcessEvent):
+    _on_change = None
 
+    def __init__(self, on_change):
+        super().__init__()
+        self._on_change = on_change
 
-def find_diff(prev_map, target_dir):
-    diff = {}
+    def _main(self, event):
+        self._on_change(event.pathname)
 
-    for (dir_path, dir_names, file_names) in walk(target_dir, topdown=False):
-        for path in map(lambda n: dir_path + '/' + n, filter(lambda p: '.DS_Store' not in p, file_names)):
-            file_hash = md5_checksum(path)
-
-            if path not in prev_map or file_hash != prev_map[path]:
-                diff[path] = file_hash
-
-    return diff
-
-
-def observe_directory(target_dir, on_changed, interval_sec=5):
-    current_map = find_diff({}, target_dir)
-
-    while True:
-        time.sleep(interval_sec)
-        next_diff = find_diff(current_map, target_dir)
-
-        if len(next_diff) == 0:
-            continue
-
-        for (affected_path, new_hash) in next_diff.items():
-            on_changed(affected_path)
-            current_map[affected_path] = new_hash
+    process_IN_CREATE = _main  # override events functions
+    process_IN_MODIFY = _main
 
 
 def sync_with_docker(local, remote, container, path):
     start_index = local.find(remote)
     remote_path = path[start_index:]
 
-    print('Updating: {}'.format(path))
-    # print(['docker', 'cp', path, '{}:{}'.format(container, remote_path)])
-    call(['docker', 'cp', path, '{}:{}'.format(container, remote_path)])
+    print(f"Updating: {path=}")
+    os.system(f"docker cp path {container}:{remote_path}")
 
 
-parser = argparse.ArgumentParser(description='Auto-sync files from given root with docker container remote directory')
-parser.add_argument('root', help='Root directory to observe')
-parser.add_argument('-r', '--remote', dest='remote_root', required=True, help='Remote root to upload into')
-parser.add_argument('-c', '--container', dest='container_name', required=True,
-                    help='Docker container name, use `docker ps` to find the your container name')
+def main():
+    parser = argparse.ArgumentParser(
+        description='Auto-sync files from given root with docker container remote directory')
+    parser.add_argument('root', help='Root directory to observe')
+    parser.add_argument('-r', '--remote', dest='remote_root', required=True, help='Remote root to upload into')
+    parser.add_argument('-c', '--container', dest='container_name', required=True,
+                        help='Docker container name, use `docker ps` to find the your container name')
+    args = parser.parse_args()
+    root = args.root
+    remote_root = args.remote_root
+    container_name = args.container_name
 
-args = parser.parse_args()
-root = args.root
-remote_root = args.remote_root
-container_name = args.container_name
+    if remote_root not in root:
+        print('Local root must observe the same directory as the remote')
+        exit(1)
 
-print(root, remote_root, container_name)
+    print(f"{root=}, {remote_root=}, {container_name=}")
 
-if root.find(remote_root) == -1:
-    print('Local root must observe the same directory as the remote')
-    exit(1)
+    kwargs = {'local': root,
+              'remote_root': remote_root,
+              'container_name': container_name}
 
-# file deletion is not supported
-observe_directory(root, on_changed=lambda updated_file_path: sync_with_docker(
-    root, remote_root, container_name, updated_file_path
-))
+    on_change = partial(sync_with_docker, **kwargs)
+    handler = EventHandler(on_change)
+    wm = pyinotify.WatchManager()
+    mask = pyinotify.IN_MODIFY | pyinotify.IN_CREATE
+    excl = pyinotify.ExcludeFilter(IGNORE)
+    wm.add_watch(root, mask, rec=True, exclude_filter=excl)
+    notifier = pyinotify.Notifier(wm, handler)
+
+    print("press ^C to stop")
+    notifier.loop()
+
+
+if __name__ == '__main__':
+    main()
